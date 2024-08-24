@@ -1,0 +1,23 @@
+session_name: expiring-bloom-rs
+shell_command_before: "export RUST_LOG=info; clear"
+windows:
+  - window_name: code
+    focus: true
+    start-directory: ./
+    panes:
+      - shell_command:
+        - helix
+  - window_name: cmd1
+    start-directory: ./
+    panes:
+      - shell_command:
+        - clear
+  - window_name: cmd2
+    start-directory: ./
+    panes:
+      - shell_command:
+        - clear
+  - window_name: notes
+    panes:
+      - shell_command:
+        - emacs -nw notes.org

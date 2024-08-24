@@ -1,0 +1,15 @@
+#+title: Notes
+
+* Ideas
+** No std?
+** TODO backend for redis using rustis
+** TODO I think need one hash function
+instead of K hash function can use composite hash function which will create K different hashes
+using so called 2 hash trick:
+```python
+def get_hashes(key, k, m):
+    h1 = hash1(key)
+    h2 = hash2(key)
+    for i in range(k):
+        yield (h1 + i * h2) % m
+```
