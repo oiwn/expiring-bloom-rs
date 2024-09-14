@@ -3,6 +3,9 @@
 * Ideas
 ** No std?
 ** TODO backend for redis using rustis
+** TODO backend for redb using redb crate
+** TODO https://github.com/Cyan4973/xxHash - maybe check this hash?
+https://docs.rs/twox-hash/latest/twox_hash/
 ** TODO I think need one hash function
 instead of K hash function can use composite hash function which will create K different hashes
 using so called 2 hash trick:
