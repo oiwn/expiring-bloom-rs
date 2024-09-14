@@ -1,3 +1,28 @@
+#![allow(non_upper_case_globals)]
+/// This is implementation of Silding Bloom Filter.
+///
+/// Features:
+///    * Sub-Filters: The main Bloom filter is divided into N sub-filters:  BF_1, BF_2, …, BF_N .
+///    * Time Windows: Each sub-filter corresponds to a fixed time window  T  (e.g., 1 minute).
+///    * Rotation Mechanism: Sub-filters are rotated in a circular manner to represent sliding
+///      time intervals.
+///
+/// Insertion:
+///     * When an element is added at time  t , it is inserted into the current sub-filter  BF_{current}.
+///     * Hash the element using the standard Bloom filter hash functions and set the bits in  BF_{current} .
+/// Query:
+///     * To check if an element is in the filter, perform the query against all active sub-filters.
+///     * If all the required bits are set in any sub-filter, the element is considered present.
+/// Expiration:
+///     * At each time interval  T , the oldest sub-filter  BF_{oldest}  is cleared.
+///     * The cleared sub-filter becomes the new  BF_{current}  for incoming elements.
+///     * This effectively removes elements that were only in  BF_{oldest} , thus expiring them.
+///
+/// Obvious problems:
+///     * False Positives: As elements may exist in multiple sub-filters,
+///       the probability of false positives can increase.
+///     * Synchronization: In concurrent environments, care must be taken to synchronize
+///       access during sub-filter rotation.
 use bitvec::prelude::*;
 use fnv::FnvHasher;
 use murmur3::murmur3_32;
@@ -13,25 +38,178 @@ pub trait BitVector {
     fn clear(&mut self);
 }
 
-// Trait for hash functions
-pub trait HashFunction {
-    fn hash(&self, item: &[u8]) -> Vec<usize>;
-    // fn hash(&self, item: &[u8], number_of_hashes: usize) -> Vec<usize>;
+/// A type alias for the hash function used in the Bloom filter.
+///
+/// This function takes an input item and computes multiple hash indices
+/// for the Bloom filter's bit vector.
+///
+/// **Parameters:**
+///
+/// - `item: &[u8]`
+///   - A byte slice representing the item to be hashed.
+/// - `num_hashes: usize`
+///   - The number of hash values to compute for the item.
+/// - `capacity: usize`
+///   - The size of the Bloom filter's bit vector. This ensures that
+///     the generated hash indices are within valid bounds.
+///
+/// **Returns:**
+///
+/// - `Vec<u32>`
+///   - A vector of hash indices corresponding to positions in the bit vector.
+///
+/// **Usage:**
+///
+/// The hash function computes `num_hashes` hash indices for the given `item`,
+/// ensuring each index is within the range `[0, capacity)`. These indices are
+/// used to set or check bits in the Bloom filter's bit vector.
+type HashFunction = fn(&[u8], usize, usize) -> Vec<u32>;
+
+fn hash_murmur32(key: &[u8]) -> u32 {
+    let mut cursor = Cursor::new(key);
+    murmur3_32(&mut cursor, 0).expect("Failed to compute Murmur3 hash")
+}
+
+fn hash_fnv32(key: &[u8]) -> u32 {
+    let mut hasher = FnvHasher::default();
+    hasher.write(key);
+    hasher.finish() as u32
+}
+
+pub fn default_hash_function(
+    item: &[u8],
+    num_hashes: usize,
+    capacity: usize,
+) -> Vec<u32> {
+    let h1 = hash_murmur32(item);
+    let h2 = hash_fnv32(item);
+    (0..num_hashes)
+        .map(|i| h1.wrapping_add((i as u32).wrapping_mul(h2)) % capacity as u32)
+        .collect()
 }
 
 // Structure for a single Bloom filter level
-pub struct BloomFilterLevel<B: BitVector> {
+pub struct SlidingBloomFilterLevel<B: BitVector> {
     bit_vector: B,
     timestamp: SystemTime,
 }
 
-// Main structure for the Time-Decaying Bloom Filter
-pub struct TimeDecayingBloomFilter<B: BitVector, H: HashFunction> {
-    levels: Vec<BloomFilterLevel<B>>,
-    hash_functions: Vec<H>,
+pub struct SlidingBloomFilter<B: BitVector> {
+    levels: Vec<SlidingBloomFilterLevel<B>>,
+    hash_function: HashFunction,
     capacity: usize,
+    num_hashes: usize,
     false_positive_rate: f64,
-    decay_time: Duration,
+    bit_vector_size: usize,
+    level_time: Duration,
+    max_levels: usize,
+}
+
+fn optimal_bit_vector_size(n: usize, fpr: f64) -> usize {
+    let ln2 = std::f64::consts::LN_2;
+    ((-(n as f64) * fpr.ln()) / (ln2 * ln2)).ceil() as usize
+}
+
+fn optimal_num_hashes(n: usize, m: usize) -> usize {
+    ((m as f64 / n as f64) * std::f64::consts::LN_2).round() as usize
+}
+
+impl<B: BitVector> SlidingBloomFilter<B> {
+    pub fn new(
+        capacity: usize,
+        false_positive_rate: f64,
+        level_time: Duration,
+        max_levels: usize,
+        hash_function: HashFunction,
+    ) -> Self {
+        let bit_vector_size =
+            optimal_bit_vector_size(capacity, false_positive_rate);
+        let num_hashes = optimal_num_hashes(capacity, bit_vector_size);
+        Self {
+            levels: Vec::new(),
+            hash_function,
+            capacity,
+            bit_vector_size,
+            num_hashes,
+            false_positive_rate,
+            level_time,
+            max_levels,
+        }
+    }
+
+    pub fn cleanup_expired_levels(&mut self) {
+        let now = SystemTime::now();
+        self.levels.retain(|level| {
+            match now.duration_since(level.timestamp) {
+                Ok(elapsed) => elapsed < self.level_time * self.max_levels as u32,
+                Err(_) => true, // Keep the level if system time went backwards
+            }
+        });
+    }
+
+    fn should_create_new_level(&self) -> bool {
+        if let Some(last_level) = self.levels.last() {
+            let now = SystemTime::now();
+            match now.duration_since(last_level.timestamp) {
+                Ok(elapsed) => elapsed >= self.level_time,
+                Err(_) => false, // Handle system time going backwards (Sometimes causing error)
+            }
+        } else {
+            // If no levels exist, create one
+            true
+        }
+    }
+
+    fn create_new_level(&mut self) {
+        let level = SlidingBloomFilterLevel {
+            bit_vector: B::new(self.bit_vector_size),
+            timestamp: SystemTime::now(),
+        };
+        self.levels.push(level);
+        // Ensure we don't exceed the maximum number of levels
+        if self.levels.len() > self.max_levels {
+            self.levels.remove(0);
+        }
+    }
+
+    pub fn insert(&mut self, item: &[u8]) {
+        if self.should_create_new_level() {
+            self.create_new_level();
+        }
+        let latest_level = self.levels.last_mut().unwrap();
+        let hashes = (self.hash_function)(item, self.num_hashes, self.capacity);
+        for hash in hashes {
+            latest_level.bit_vector.set(hash as usize);
+        }
+    }
+
+    pub fn query(&self, item: &[u8]) -> bool {
+        for level in &self.levels {
+            let hashes =
+                (self.hash_function)(item, self.num_hashes, self.capacity);
+            if hashes
+                .iter()
+                .all(|&hash| level.bit_vector.get(hash as usize))
+            {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+impl<B: BitVector> std::fmt::Debug for SlidingBloomFilter<B> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "SlidingBloomFilter {{ capacity: {}, num_hashes: {}, false_positive_rate: {}, level_time: {:?}, max_levels: {} }}",
+            self.capacity,
+            self.num_hashes,
+            self.false_positive_rate,
+            self.level_time,
+            self.max_levels
+        )
+    }
 }
 
 pub struct BitVecBitVector {
@@ -58,508 +236,337 @@ impl BitVector for BitVecBitVector {
     }
 }
 
-// Trait for Time-Decaying Bloom Filter operations
-pub trait BloomFilterOperations<B: BitVector, H: HashFunction> {
-    fn new(
-        capacity: usize,
-        false_positive_rate: f64,
-        decay_time: Duration,
-        hash_functions: Vec<H>,
-    ) -> Self;
-
-    fn insert(&mut self, item: &[u8]);
-    fn query(&self, item: &[u8]) -> bool;
-    fn cleanup(&mut self);
-}
-
-// Implementation block (without actual implementations)
-impl<B: BitVector, H: HashFunction> BloomFilterOperations<B, H>
-    for TimeDecayingBloomFilter<B, H>
-{
-    fn new(
-        capacity: usize,
-        false_positive_rate: f64,
-        decay_time: Duration,
-        hash_functions: Vec<H>,
-    ) -> Self {
-        // Implementation here
-
-        let num_bits = Self::calculate_num_bits(capacity, false_positive_rate);
-        let level = BloomFilterLevel {
-            bit_vector: B::new(num_bits),
-            timestamp: SystemTime::now(),
-        };
-
-        TimeDecayingBloomFilter {
-            levels: vec![level],
-            hash_functions,
-            capacity,
-            false_positive_rate,
-            decay_time,
-        }
-    }
-
-    fn insert(&mut self, item: &[u8]) {
-        let current_time = SystemTime::now();
-        if self.levels.is_empty()
-            || current_time
-                .duration_since(self.levels.last().unwrap().timestamp)
-                .unwrap()
-                > self.decay_time
-        {
-            self.levels.push(BloomFilterLevel {
-                bit_vector: B::new(Self::calculate_num_bits(
-                    self.capacity,
-                    self.false_positive_rate,
-                )),
-                timestamp: current_time,
-            });
-        }
-
-        let level = self.levels.last_mut().unwrap();
-        for hash_function in &self.hash_functions {
-            for index in hash_function.hash(item) {
-                level.bit_vector.set(
-                    index
-                        % Self::calculate_num_bits(
-                            self.capacity,
-                            self.false_positive_rate,
-                        ),
-                );
-            }
-        }
-    }
-
-    fn query(&self, item: &[u8]) -> bool {
-        let current_time = SystemTime::now();
-        self.levels
-            .iter()
-            .rev()
-            .take_while(|level| {
-                current_time.duration_since(level.timestamp).unwrap()
-                    <= self.decay_time
-            })
-            .any(|level| {
-                self.hash_functions.iter().all(|hash_function| {
-                    hash_function.hash(item).iter().all(|&index| {
-                        level.bit_vector.get(
-                            index
-                                % Self::calculate_num_bits(
-                                    self.capacity,
-                                    self.false_positive_rate,
-                                ),
-                        )
-                    })
-                })
-            })
-    }
-
-    fn cleanup(&mut self) {
-        let current_time = SystemTime::now();
-        self.levels.retain(|level| {
-            current_time.duration_since(level.timestamp).unwrap()
-                <= self.decay_time
-        });
-    }
-}
-
-impl<B: BitVector, H: HashFunction> TimeDecayingBloomFilter<B, H> {
-    fn calculate_num_bits(capacity: usize, false_positive_rate: f64) -> usize {
-        let m =
-            -(capacity as f64 * false_positive_rate.ln()) / (2f64.ln().powi(2));
-        m.ceil() as usize
-    }
-}
-
-pub struct MurmurFNVHashFunction {
-    num_hashes: usize,
-    bit_vector_size: usize,
-}
-
-impl MurmurFNVHashFunction {
-    pub fn new(num_hashes: usize, bit_vector_size: usize) -> Self {
-        MurmurFNVHashFunction {
-            num_hashes,
-            bit_vector_size,
-        }
-    }
-
-    fn hash1(&self, key: &[u8]) -> u32 {
-        let mut cursor = Cursor::new(key);
-        murmur3_32(&mut cursor, 0).expect("Failed to compute Murmur3 hash")
-    }
-
-    fn hash2(&self, key: &[u8]) -> u32 {
-        let mut hasher = FnvHasher::default();
-        hasher.write(key);
-        hasher.finish() as u32
-    }
-}
-
-impl HashFunction for MurmurFNVHashFunction {
-    fn hash(&self, item: &[u8]) -> Vec<usize> {
-        let h1 = self.hash1(item);
-        let h2 = self.hash2(item);
-
-        (0..self.num_hashes)
-            .map(|i| {
-                ((h1 as u64 + i as u64 * h2 as u64) % self.bit_vector_size as u64)
-                    as usize
-            })
-            .collect()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashSet;
+    use rand::Rng;
     use std::thread;
 
-    // Mock implementations for testing
-    struct MockBitVector {
-        bits: Vec<bool>,
+    #[test]
+    fn test_workflow() {
+        let hash_function = |item: &[u8],
+                             num_hashes_var: usize,
+                             capacity_var: usize|
+         -> Vec<u32> {
+            let h1 = hash_murmur32(item);
+            let h2 = hash_fnv32(item);
+            (0..num_hashes_var)
+                .map(|i| {
+                    h1.wrapping_add((i as u32).wrapping_mul(h2))
+                        % capacity_var as u32
+                })
+                .collect()
+        };
+        const capacity: usize = 1000;
+        const num_hashes: usize = 7;
+        const false_positive_rate: f64 = 0.01;
+        const decay_time: Duration = Duration::new(10, 0);
+
+        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+            capacity,
+            false_positive_rate,
+            decay_time,
+            num_hashes,
+            hash_function,
+        );
+        bloom_filter.insert(b"some data");
+        bloom_filter.insert(b"another data");
+        assert!(bloom_filter.query(b"some data"));
+        assert!(bloom_filter.query(b"another data"));
+        assert!(!bloom_filter.query(b"some"));
+        assert!(!bloom_filter.query(b"another"));
     }
 
-    impl BitVector for MockBitVector {
-        fn new(size: usize) -> Self {
-            MockBitVector {
-                bits: vec![false; size],
-            }
-        }
-        fn set(&mut self, index: usize) {
-            self.bits[index] = true;
-        }
-        fn get(&self, index: usize) -> bool {
-            self.bits[index]
-        }
-        fn clear(&mut self) {
-            self.bits.fill(false);
-        }
+    #[test]
+    fn test_expiration_of_elements() {
+        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+            100,
+            0.01,
+            Duration::from_secs(1),
+            2,
+            default_hash_function,
+        );
+
+        bloom_filter.insert(b"item1");
+        assert!(bloom_filter.query(b"item1"));
+
+        // Wait enough time for the item to expire
+        thread::sleep(Duration::from_secs(5)); // Exceeds MAX_LEVELS * LEVEL_TIME
+
+        // Call cleanup explicitly
+        bloom_filter.cleanup_expired_levels();
+
+        assert!(!bloom_filter.query(b"item1"));
     }
 
-    struct MockHashFunction;
+    #[test]
+    fn test_no_false_negatives_within_decay_time() {
+        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+            1000,
+            0.01,
+            Duration::from_secs(2),
+            5,
+            default_hash_function,
+        );
 
-    impl HashFunction for MockHashFunction {
-        fn hash(&self, item: &[u8]) -> Vec<usize> {
-            vec![item[0] as usize % 10, item[0] as usize % 20]
+        let items: Vec<&[u8]> =
+            vec![b"apple", b"banana", b"cherry", b"date", b"elderberry"];
+
+        for item in &items {
+            bloom_filter.insert(item);
+        }
+
+        // Query immediately
+        for item in &items {
+            assert!(bloom_filter.query(item));
+        }
+
+        // Wait less than total decay time
+        thread::sleep(Duration::from_secs(5)); // Less than MAX_LEVELS * LEVEL_TIME
+        bloom_filter.cleanup_expired_levels();
+
+        for item in &items {
+            assert!(bloom_filter.query(item));
         }
     }
 
     #[test]
-    fn test_correctness() {
-        let hash_function1 = MurmurFNVHashFunction::new(3, 1000);
-        let hash_function2 = MurmurFNVHashFunction::new(3, 1000);
-        let mut bf = TimeDecayingBloomFilter::<
-            BitVecBitVector,
-            MurmurFNVHashFunction,
-        >::new(
+    fn test_items_expire_after_decay_time() {
+        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+            100,
+            0.01,
+            Duration::from_secs(1),
+            3,
+            default_hash_function,
+        );
+
+        bloom_filter.insert(b"item_to_expire");
+        assert!(bloom_filter.query(b"item_to_expire"));
+
+        // Wait for the item to expire
+        thread::sleep(Duration::from_secs(4)); // Exceeds MAX_LEVELS * LEVEL_TIME
+        bloom_filter.cleanup_expired_levels();
+
+        assert!(!bloom_filter.query(b"item_to_expire"));
+    }
+
+    #[test]
+    fn test_continuous_insertion_and_query() {
+        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
             1000,
             0.01,
             Duration::from_secs(1),
-            vec![hash_function1, hash_function2],
+            5,
+            default_hash_function,
         );
 
-        // Test insertion and querying
-        bf.insert(b"test_item");
-        assert!(
-            bf.query(b"test_item"),
-            "Item should be found after insertion"
-        );
-        assert!(
-            !bf.query(b"not_inserted"),
-            "Non-inserted item should not be found"
-        );
-
-        // Test decay
-        std::thread::sleep(Duration::from_secs(2));
-        bf.cleanup();
-        assert!(
-            !bf.query(b"test_item"),
-            "Item should not be found after decay time"
-        );
-
-        // Test multiple insertions
-        for i in 0..100 {
-            bf.insert(format!("item_{}", i).as_bytes());
+        for i in 0..10 {
+            let item = format!("item_{}", i);
+            bloom_filter.insert(item.as_bytes());
+            assert!(bloom_filter.query(item.as_bytes()));
+            thread::sleep(Duration::from_millis(400));
         }
 
-        // Verify all inserted items are found
-        for i in 0..100 {
+        // Wait for earlier items to expire
+        thread::sleep(Duration::from_secs(3));
+        bloom_filter.cleanup_expired_levels();
+
+        // Items 0 to 4 should have expired
+        for i in 0..6 {
+            let item = format!("item_{}", i);
             assert!(
-                bf.query(format!("item_{}", i).as_bytes()),
-                "Item {} should be found",
-                i
+                !bloom_filter.query(item.as_bytes()),
+                "Item {} should have expired",
+                item
             );
         }
 
-        // Verify false positive rate
+        // Items 5 to 9 should still be present
+        for i in 6..10 {
+            let item = format!("item_{}", i);
+            assert!(
+                bloom_filter.query(item.as_bytes()),
+                "Item {} should still be present",
+                item
+            );
+        }
+    }
+
+    #[test]
+    fn test_false_positive_rate() {
+        const FALSE_POSITIVE_RATE: f64 = 0.05;
+
+        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+            10000,
+            FALSE_POSITIVE_RATE,
+            Duration::from_secs(2),
+            5,
+            default_hash_function,
+        );
+
+        let num_items = 1000;
+        let mut rng = rand::thread_rng();
+        let mut inserted_items = Vec::new();
+
+        // Insert random items
+        for _ in 0..num_items {
+            let item: Vec<u8> = (0..10).map(|_| rng.gen()).collect();
+            bloom_filter.insert(&item);
+            inserted_items.push(item);
+        }
+
+        // Test for false positives
         let mut false_positives = 0;
-        for i in 100..1100 {
-            // Test 1000 non-inserted items
-            if bf.query(format!("non_item_{}", i).as_bytes()) {
-                false_positives += 1;
+        let num_tests = 1000;
+
+        bloom_filter.cleanup_expired_levels();
+
+        for _ in 0..num_tests {
+            let item: Vec<u8> = (0..10).map(|_| rng.gen()).collect();
+            if bloom_filter.query(&item) {
+                // Check if the item was actually inserted
+                if !inserted_items.contains(&item) {
+                    false_positives += 1;
+                }
             }
         }
 
-        let observed_false_positive_rate = false_positives as f64 / 1000.0;
-        println!(
-            "Observed false positive rate: {}",
-            observed_false_positive_rate
-        );
+        let observed_fpr = false_positives as f64 / num_tests as f64;
         assert!(
-            observed_false_positive_rate < 0.02,
-            "False positive rate too high"
+            observed_fpr <= FALSE_POSITIVE_RATE * 1.5,
+            "False positive rate is too high: observed {}, expected {}",
+            observed_fpr,
+            FALSE_POSITIVE_RATE
         );
     }
 
     #[test]
-    fn test_new() {
-        let bv = BitVecBitVector::new(100);
-        assert_eq!(bv.bits.len(), 100);
-        assert!(bv.bits.not_any());
-    }
+    fn test_concurrent_inserts() {
+        use std::sync::{Arc, Mutex};
+        use std::thread;
 
-    #[test]
-    fn test_set_and_get() {
-        let mut bv = BitVecBitVector::new(100);
-        bv.set(50);
-        assert!(bv.get(50));
-        assert!(!bv.get(49));
-        assert!(!bv.get(51));
-    }
+        let bloom_filter =
+            Arc::new(Mutex::new(SlidingBloomFilter::<BitVecBitVector>::new(
+                1000,
+                0.01,
+                Duration::from_secs(1),
+                5,
+                default_hash_function,
+            )));
 
-    #[test]
-    fn test_clear() {
-        let mut bv = BitVecBitVector::new(100);
-        bv.set(25);
-        bv.set(75);
-        assert!(bv.get(25));
-        assert!(bv.get(75));
-        bv.clear();
-        assert!(!bv.get(25));
-        assert!(!bv.get(75));
-        assert!(bv.bits.not_any());
-    }
+        let handles: Vec<_> = (0..10)
+            .map(|i| {
+                let bloom_filter = Arc::clone(&bloom_filter);
+                thread::spawn(move || {
+                    let item = format!("concurrent_item_{}", i);
+                    let mut bf = bloom_filter.lock().unwrap();
+                    bf.insert(item.as_bytes());
+                })
+            })
+            .collect();
 
-    #[test]
-    fn test_multiple_operations() {
-        let mut bv = BitVecBitVector::new(1000);
-        for i in (0..1000).step_by(2) {
-            bv.set(i);
+        for handle in handles {
+            handle.join().unwrap();
         }
-        for i in 0..1000 {
-            assert_eq!(bv.get(i), i % 2 == 0);
+
+        bloom_filter.lock().unwrap().cleanup_expired_levels();
+
+        // Verify that all items have been inserted
+        for i in 0..10 {
+            let item = format!("concurrent_item_{}", i);
+            let bf = bloom_filter.lock().unwrap();
+            assert!(bf.query(item.as_bytes()));
         }
-        bv.clear();
-        assert!(bv.bits.not_any());
     }
 
     #[test]
-    fn test_new_bloom_filter() {
-        let bf = TimeDecayingBloomFilter::<MockBitVector, MockHashFunction>::new(
+    fn test_full_capacity() {
+        const FALSE_POSITIVE_RATE: f64 = 0.1;
+
+        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+            100,
+            FALSE_POSITIVE_RATE,
+            Duration::from_secs(1),
+            5,
+            default_hash_function,
+        );
+
+        // Insert more items than capacity to test behavior
+        for i in 0..200 {
+            let item = format!("item_{}", i);
+            bloom_filter.insert(item.as_bytes());
+
+            bloom_filter.cleanup_expired_levels();
+            assert!(bloom_filter.query(item.as_bytes()));
+        }
+
+        bloom_filter.cleanup_expired_levels();
+        // Expect higher false positive rate due to saturation
+        let false_queries = (200..300)
+            .filter(|i| {
+                let item = format!("item_{}", i);
+                bloom_filter.query(item.as_bytes())
+            })
+            .count();
+
+        let observed_fpr = false_queries as f64 / 100.0;
+        assert!(
+            observed_fpr >= FALSE_POSITIVE_RATE,
+            "False positive rate is lower than expected: observed {}, expected {}",
+            observed_fpr,
+            FALSE_POSITIVE_RATE
+        );
+    }
+
+    #[test]
+    fn test_clear_functionality() {
+        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
             1000,
             0.01,
-            Duration::from_secs(3600),
-            vec![MockHashFunction, MockHashFunction],
+            Duration::from_secs(1),
+            5,
+            default_hash_function,
         );
 
-        assert_eq!(bf.capacity, 1000);
-        assert_eq!(bf.false_positive_rate, 0.01);
-        assert_eq!(bf.decay_time, Duration::from_secs(3600));
-        assert_eq!(bf.hash_functions.len(), 2);
-        assert_eq!(bf.levels.len(), 1); // Should start with one level
+        bloom_filter.insert(b"persistent_item");
+
+        // Insert items that should expire
+        bloom_filter.insert(b"temp_item");
+
+        bloom_filter.cleanup_expired_levels();
+        assert!(bloom_filter.query(b"temp_item"));
+
+        // Wait for the temporary item to expire
+        thread::sleep(Duration::from_secs(6)); // Exceeds MAX_LEVELS * LEVEL_TIME
+        bloom_filter.cleanup_expired_levels();
+
+        // "temp_item" should be expired
+        assert!(!bloom_filter.query(b"temp_item"));
+
+        // "persistent_item" should be also expired
+        assert!(!bloom_filter.query(b"persistent_item"));
     }
 
     #[test]
-    fn test_insert_and_query() {
-        let mut bf =
-            TimeDecayingBloomFilter::<MockBitVector, MockHashFunction>::new(
-                1000,
-                0.01,
-                Duration::from_secs(3600),
-                vec![MockHashFunction],
-            );
+    fn test_should_create_new_level_edge_case() {
+        const MAX_LEVELS: usize = 3;
 
-        bf.insert(b"test");
-        assert!(bf.query(b"test"), "Item should be found after insertion");
-        assert!(
-            !bf.query(b"not_inserted"),
-            "Non-inserted item should not be found"
-        );
-    }
-
-    #[test]
-    fn test_decay() {
-        let mut bf =
-            TimeDecayingBloomFilter::<MockBitVector, MockHashFunction>::new(
-                1000,
-                0.01,
-                Duration::from_secs(1), // 1 second decay time for testing
-                vec![MockHashFunction],
-            );
-
-        bf.insert(b"test");
-        assert!(
-            bf.query(b"test"),
-            "Item should be found immediately after insertion"
+        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+            1000,
+            0.01,
+            Duration::from_millis(500),
+            MAX_LEVELS,
+            default_hash_function,
         );
 
-        // Simulate passage of time
-        std::thread::sleep(Duration::from_secs(2));
-
-        bf.cleanup();
-        assert!(
-            !bf.query(b"test"),
-            "Item should not be found after decay time"
-        );
-    }
-
-    #[test]
-    fn test_murmur_fnv_hash_function() {
-        let hash_function = MurmurFNVHashFunction::new(5, 100);
-        let key = b"test_key";
-        let hashes = hash_function.hash(key);
-
-        assert_eq!(hashes.len(), 5);
-        assert!(hashes.iter().all(|&h| h < 100));
-
-        // Check that hashes are different
-        assert!(hashes.windows(2).all(|w| w[0] != w[1]));
-    }
-
-    #[test]
-    fn test_consistency() {
-        let hash_function = MurmurFNVHashFunction::new(3, 1000);
-        let key = b"another_test_key";
-        let hashes1 = hash_function.hash(key);
-        let hashes2 = hash_function.hash(key);
-
-        assert_eq!(hashes1, hashes2, "Hash function should be deterministic");
-    }
-
-    #[test]
-    fn test_murmur_fnv_hash_function_creation() {
-        let hash_function = MurmurFNVHashFunction::new(5, 100);
-        assert_eq!(hash_function.num_hashes, 5);
-        assert_eq!(hash_function.bit_vector_size, 100);
-    }
-
-    #[test]
-    fn test_hash_output_length() {
-        let hash_function = MurmurFNVHashFunction::new(5, 100);
-        let key = b"test_key";
-        let hashes = hash_function.hash(key);
-        assert_eq!(hashes.len(), 5);
-    }
-
-    #[test]
-    fn test_hash_output_range() {
-        let bit_vector_size = 100;
-        let hash_function = MurmurFNVHashFunction::new(5, bit_vector_size);
-        let key = b"test_key";
-        let hashes = hash_function.hash(key);
-        assert!(hashes.iter().all(|&h| h < bit_vector_size));
-    }
-
-    #[test]
-    fn test_hash_consistency() {
-        let hash_function = MurmurFNVHashFunction::new(5, 100);
-        let key = b"test_key";
-        let hashes1 = hash_function.hash(key);
-        let hashes2 = hash_function.hash(key);
-        assert_eq!(hashes1, hashes2, "Hash function should be deterministic");
-    }
-
-    #[test]
-    fn test_hash_uniqueness() {
-        let hash_function = MurmurFNVHashFunction::new(5, 1000);
-        let key1 = b"test_key_1";
-        let key2 = b"test_key_2";
-        let hashes1 = hash_function.hash(key1);
-        let hashes2 = hash_function.hash(key2);
-        assert_ne!(
-            hashes1, hashes2,
-            "Different keys should produce different hash sets"
-        );
-    }
-
-    #[test]
-    fn test_hash_distribution() {
-        let bit_vector_size = 1000;
-        let hash_function = MurmurFNVHashFunction::new(5, bit_vector_size);
-        let mut hash_counts = vec![0; bit_vector_size];
-
-        // Generate hashes for a large number of keys
-        for i in 0..10000 {
-            let key = format!("test_key_{}", i).into_bytes();
-            let hashes = hash_function.hash(&key);
-            for hash in hashes {
-                hash_counts[hash] += 1;
-            }
+        // Rapid insertions to test level creation
+        for i in 0..10 {
+            let item = format!("rapid_item_{}", i);
+            bloom_filter.insert(item.as_bytes());
+            thread::sleep(Duration::from_millis(100)); // Sleep less than LEVEL_TIME
         }
 
-        // Check that all positions have been hashed to at least once
-        assert!(hash_counts.iter().all(|&count| count > 0));
-
-        // Check that no position has been hashed to excessively often
-        let max_count = *hash_counts.iter().max().unwrap();
-        let min_count = *hash_counts.iter().min().unwrap();
-        println!("Max count: {}, Min count: {}", max_count, min_count);
-        assert!(
-            (max_count as f64 / min_count as f64) < 3.0,
-            "Hash distribution is too uneven"
-        );
-    }
-
-    #[test]
-    fn test_multiple_levels() {
-        let mut bf =
-            TimeDecayingBloomFilter::<MockBitVector, MockHashFunction>::new(
-                1000,
-                0.01,
-                Duration::from_millis(5),
-                vec![MockHashFunction],
-            );
-
-        bf.insert(b"level1");
-        thread::sleep(Duration::from_millis(10));
-        bf.insert(b"level2");
-
-        assert_eq!(
-            bf.levels.len(),
-            2,
-            "Should have two levels after inserting with delay"
-        );
-        assert!(bf.query(b"level1"));
-        assert!(bf.query(b"level2"));
-    }
-
-    #[test]
-    fn test_hash_collision_resistance() {
-        let hash_function = MurmurFNVHashFunction::new(5, 1000);
-        let mut unique_hashes = HashSet::new();
-
-        // Generate hashes for a large number of keys
-        for i in 0..10000 {
-            let key = format!("test_key_{}", i).into_bytes();
-            let hashes = hash_function.hash(&key);
-            unique_hashes.insert(hashes);
-        }
-
-        // Check that we have a high number of unique hash sets
-        assert!(unique_hashes.len() > 9900, "Too many hash collisions");
-    }
-
-    #[test]
-    fn test_different_num_hashes() {
-        let hash_function1 = MurmurFNVHashFunction::new(3, 100);
-        let hash_function2 = MurmurFNVHashFunction::new(5, 100);
-        let key = b"test_key";
-        let hashes1 = hash_function1.hash(key);
-        let hashes2 = hash_function2.hash(key);
-        assert_eq!(hashes1.len(), 3);
-        assert_eq!(hashes2.len(), 5);
-        assert_eq!(hashes1, &hashes2[0..3]);
+        // Levels should have been created appropriately
+        assert!(bloom_filter.levels.len() <= MAX_LEVELS);
     }
 }
