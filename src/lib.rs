@@ -1,4 +1,3 @@
-#![allow(non_upper_case_globals)]
 /// This is implementation of Silding Bloom Filter.
 ///
 /// Features:
@@ -23,20 +22,16 @@
 ///       the probability of false positives can increase.
 ///     * Synchronization: In concurrent environments, care must be taken to synchronize
 ///       access during sub-filter rotation.
-use bitvec::prelude::*;
+///     * Since 32 bit hashes used, max capacity would be 2**32-1 (Not sure)
 use fnv::FnvHasher;
 use murmur3::murmur3_32;
 use std::hash::Hasher;
 use std::io::Cursor;
 use std::time::{Duration, SystemTime};
 
-// Trait for the bit vector backend
-pub trait BitVector {
-    fn new(size: usize) -> Self;
-    fn set(&mut self, index: usize);
-    fn get(&self, index: usize) -> bool;
-    fn clear(&mut self);
-}
+pub mod backends;
+
+use crate::backends::BloomFilterStorage;
 
 /// A type alias for the hash function used in the Bloom filter.
 ///
@@ -88,21 +83,15 @@ pub fn default_hash_function(
         .collect()
 }
 
-// Structure for a single Bloom filter level
-pub struct SlidingBloomFilterLevel<B: BitVector> {
-    bit_vector: B,
-    timestamp: SystemTime,
-}
-
-pub struct SlidingBloomFilter<B: BitVector> {
-    levels: Vec<SlidingBloomFilterLevel<B>>,
+pub struct SlidingBloomFilter<S: BloomFilterStorage> {
+    storage: S,
     hash_function: HashFunction,
     capacity: usize,
     num_hashes: usize,
     false_positive_rate: f64,
-    bit_vector_size: usize,
     level_time: Duration,
     max_levels: usize,
+    current_level_index: usize,
 }
 
 fn optimal_bit_vector_size(n: usize, fpr: f64) -> usize {
@@ -114,7 +103,7 @@ fn optimal_num_hashes(n: usize, m: usize) -> usize {
     ((m as f64 / n as f64) * std::f64::consts::LN_2).round() as usize
 }
 
-impl<B: BitVector> SlidingBloomFilter<B> {
+impl<S: BloomFilterStorage> SlidingBloomFilter<S> {
     pub fn new(
         capacity: usize,
         false_positive_rate: f64,
@@ -125,80 +114,86 @@ impl<B: BitVector> SlidingBloomFilter<B> {
         let bit_vector_size =
             optimal_bit_vector_size(capacity, false_positive_rate);
         let num_hashes = optimal_num_hashes(capacity, bit_vector_size);
+
         Self {
-            levels: Vec::new(),
+            storage: S::new(bit_vector_size, max_levels),
             hash_function,
             capacity,
-            bit_vector_size,
             num_hashes,
             false_positive_rate,
             level_time,
             max_levels,
+            current_level_index: 0,
         }
     }
 
     pub fn cleanup_expired_levels(&mut self) {
         let now = SystemTime::now();
-        self.levels.retain(|level| {
-            match now.duration_since(level.timestamp) {
-                Ok(elapsed) => elapsed < self.level_time * self.max_levels as u32,
-                Err(_) => true, // Keep the level if system time went backwards
+        for level in 0..self.max_levels {
+            if let Some(timestamp) = self.storage.get_timestamp(level) {
+                if now.duration_since(timestamp).unwrap()
+                    >= self.level_time * self.max_levels as u32
+                {
+                    self.storage.clear_level(level);
+                }
             }
-        });
+        }
     }
 
     fn should_create_new_level(&self) -> bool {
-        if let Some(last_level) = self.levels.last() {
+        let current_level = self.current_level_index;
+        if let Some(last_timestamp) = self.storage.get_timestamp(current_level) {
             let now = SystemTime::now();
-            match now.duration_since(last_level.timestamp) {
-                Ok(elapsed) => elapsed >= self.level_time,
-                Err(_) => false, // Handle system time going backwards (Sometimes causing error)
-            }
+            now.duration_since(last_timestamp).unwrap() >= self.level_time
         } else {
-            // If no levels exist, create one
             true
         }
     }
 
     fn create_new_level(&mut self) {
-        let level = SlidingBloomFilterLevel {
-            bit_vector: B::new(self.bit_vector_size),
-            timestamp: SystemTime::now(),
-        };
-        self.levels.push(level);
-        // Ensure we don't exceed the maximum number of levels
-        if self.levels.len() > self.max_levels {
-            self.levels.remove(0);
-        }
+        // Advance current level index in a circular manner
+        self.current_level_index =
+            (self.current_level_index + 1) % self.max_levels;
+        // Clear the level at the new current level index
+        self.storage.clear_level(self.current_level_index);
+        // Set the timestamp
+        self.storage
+            .set_timestamp(self.current_level_index, SystemTime::now());
     }
 
     pub fn insert(&mut self, item: &[u8]) {
         if self.should_create_new_level() {
             self.create_new_level();
         }
-        let latest_level = self.levels.last_mut().unwrap();
+        let current_level = self.current_level_index;
         let hashes = (self.hash_function)(item, self.num_hashes, self.capacity);
         for hash in hashes {
-            latest_level.bit_vector.set(hash as usize);
+            self.storage.set_bit(current_level, hash as usize);
         }
     }
 
     pub fn query(&self, item: &[u8]) -> bool {
-        for level in &self.levels {
-            let hashes =
-                (self.hash_function)(item, self.num_hashes, self.capacity);
-            if hashes
-                .iter()
-                .all(|&hash| level.bit_vector.get(hash as usize))
-            {
-                return true;
+        let hashes = (self.hash_function)(item, self.num_hashes, self.capacity);
+        let now = SystemTime::now();
+        for level in 0..self.max_levels {
+            if let Some(timestamp) = self.storage.get_timestamp(level) {
+                if now.duration_since(timestamp).unwrap()
+                    <= self.level_time * self.max_levels as u32
+                {
+                    if hashes
+                        .iter()
+                        .all(|&hash| self.storage.get_bit(level, hash as usize))
+                    {
+                        return true;
+                    }
+                }
             }
         }
         false
     }
 }
 
-impl<B: BitVector> std::fmt::Debug for SlidingBloomFilter<B> {
+impl<B: BloomFilterStorage> std::fmt::Debug for SlidingBloomFilter<B> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
@@ -212,33 +207,10 @@ impl<B: BitVector> std::fmt::Debug for SlidingBloomFilter<B> {
     }
 }
 
-pub struct BitVecBitVector {
-    bits: BitVec,
-}
-
-impl BitVector for BitVecBitVector {
-    fn new(size: usize) -> Self {
-        BitVecBitVector {
-            bits: bitvec![0; size],
-        }
-    }
-
-    fn set(&mut self, index: usize) {
-        self.bits.set(index, true);
-    }
-
-    fn get(&self, index: usize) -> bool {
-        self.bits[index]
-    }
-
-    fn clear(&mut self) {
-        self.bits.fill(false);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backends::InMemoryStorage;
     use rand::Rng;
     use std::thread;
 
@@ -257,18 +229,14 @@ mod tests {
                 })
                 .collect()
         };
-        const capacity: usize = 1000;
-        const num_hashes: usize = 7;
-        const false_positive_rate: f64 = 0.01;
-        const decay_time: Duration = Duration::new(10, 0);
-
-        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
-            capacity,
-            false_positive_rate,
-            decay_time,
-            num_hashes,
+        let mut bloom_filter = SlidingBloomFilter::<InMemoryStorage>::new(
+            1000,
+            0.01,
+            Duration::from_secs(10),
+            5,
             hash_function,
         );
+
         bloom_filter.insert(b"some data");
         bloom_filter.insert(b"another data");
         assert!(bloom_filter.query(b"some data"));
@@ -279,7 +247,7 @@ mod tests {
 
     #[test]
     fn test_expiration_of_elements() {
-        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+        let mut bloom_filter = SlidingBloomFilter::<InMemoryStorage>::new(
             100,
             0.01,
             Duration::from_secs(1),
@@ -301,7 +269,7 @@ mod tests {
 
     #[test]
     fn test_no_false_negatives_within_decay_time() {
-        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+        let mut bloom_filter = SlidingBloomFilter::<InMemoryStorage>::new(
             1000,
             0.01,
             Duration::from_secs(2),
@@ -332,7 +300,7 @@ mod tests {
 
     #[test]
     fn test_items_expire_after_decay_time() {
-        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+        let mut bloom_filter = SlidingBloomFilter::<InMemoryStorage>::new(
             100,
             0.01,
             Duration::from_secs(1),
@@ -351,8 +319,79 @@ mod tests {
     }
 
     #[test]
+    fn test_immediate_expiration() {
+        let mut bloom_filter = SlidingBloomFilter::<InMemoryStorage>::new(
+            100,
+            0.01,
+            Duration::from_secs(1),
+            3,
+            default_hash_function,
+        );
+
+        bloom_filter.insert(b"test_item");
+        assert!(bloom_filter.query(b"test_item"));
+
+        // Wait for total decay time
+        thread::sleep(Duration::from_secs(4));
+        bloom_filter.cleanup_expired_levels();
+        assert!(
+            !bloom_filter.query(b"test_item"),
+            "Item should have expired after total decay time"
+        );
+    }
+
+    #[test]
+    fn test_partial_expiration() {
+        let mut bloom_filter = SlidingBloomFilter::<InMemoryStorage>::new(
+            100,
+            0.01,
+            Duration::from_secs(1),
+            5,
+            default_hash_function,
+        );
+
+        // Insert old items
+        for i in 0..5 {
+            let item = format!("old_item_{}", i);
+            bloom_filter.insert(item.as_bytes());
+            thread::sleep(Duration::from_millis(200));
+        }
+
+        // Wait so that old items surpass the decay time
+        thread::sleep(Duration::from_secs(6));
+
+        // Insert new items
+        for i in 0..5 {
+            let item = format!("new_item_{}", i);
+            bloom_filter.insert(item.as_bytes());
+        }
+
+        bloom_filter.cleanup_expired_levels();
+
+        // Old items should have expired
+        for i in 0..5 {
+            let item = format!("old_item_{}", i);
+            assert!(
+                !bloom_filter.query(item.as_bytes()),
+                "Old item {} should have expired",
+                item
+            );
+        }
+
+        // New items should still be present
+        for i in 0..5 {
+            let item = format!("new_item_{}", i);
+            assert!(
+                bloom_filter.query(item.as_bytes()),
+                "New item {} should still be present",
+                item
+            );
+        }
+    }
+
+    #[test]
     fn test_continuous_insertion_and_query() {
-        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+        let mut bloom_filter = SlidingBloomFilter::<InMemoryStorage>::new(
             1000,
             0.01,
             Duration::from_secs(1),
@@ -360,19 +399,52 @@ mod tests {
             default_hash_function,
         );
 
+        // This loop with end in 1second
+        let inserts_time = SystemTime::now();
         for i in 0..10 {
             let item = format!("item_{}", i);
             bloom_filter.insert(item.as_bytes());
             assert!(bloom_filter.query(item.as_bytes()));
-            thread::sleep(Duration::from_millis(400));
+            // 0.5s so 2 elements should to to the each level
+            // and total time passed - 5 seconds
+            thread::sleep(Duration::from_millis(500))
         }
+
+        // Ensure inserts executed within 5-6 seconds
+        let inserts_duration =
+            SystemTime::now().duration_since(inserts_time).unwrap();
+        assert!(
+            inserts_duration >= Duration::from_secs(5),
+            "Should take at least 5 secs"
+        );
+        assert!(
+            inserts_duration < Duration::from_secs(6),
+            "Should take less than 6 secs"
+        );
+
+        // Should pass 5 seconds and have 5 levels!
+        assert_eq!(
+            bloom_filter.storage.levels.len(),
+            5,
+            "After 5 seconds there is should be 5 levels of filter"
+        );
+
+        for i in 0..bloom_filter.storage.num_levels() {
+            assert!(
+                bloom_filter.storage.levels[i].len() >= 1,
+                "Each level should contain at least 1 elements"
+            );
+        }
+
+        // All above should take little bit more than 5 seconds
+        // items will start expire after 5 seconds, so wait 3 seconds more.
 
         // Wait for earlier items to expire
         thread::sleep(Duration::from_secs(3));
         bloom_filter.cleanup_expired_levels();
 
-        // Items 0 to 4 should have expired
-        for i in 0..6 {
+        // Items 0 to 6 should have expired
+        for i in 0..8 {
             let item = format!("item_{}", i);
             assert!(
                 !bloom_filter.query(item.as_bytes()),
@@ -381,8 +453,8 @@ mod tests {
             );
         }
 
-        // Items 5 to 9 should still be present
-        for i in 6..10 {
+        // Items 8 to 9 should still be present
+        for i in 8..10 {
             let item = format!("item_{}", i);
             assert!(
                 bloom_filter.query(item.as_bytes()),
@@ -396,7 +468,7 @@ mod tests {
     fn test_false_positive_rate() {
         const FALSE_POSITIVE_RATE: f64 = 0.05;
 
-        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+        let mut bloom_filter = SlidingBloomFilter::<InMemoryStorage>::new(
             10000,
             FALSE_POSITIVE_RATE,
             Duration::from_secs(2),
@@ -446,7 +518,7 @@ mod tests {
         use std::thread;
 
         let bloom_filter =
-            Arc::new(Mutex::new(SlidingBloomFilter::<BitVecBitVector>::new(
+            Arc::new(Mutex::new(SlidingBloomFilter::<InMemoryStorage>::new(
                 1000,
                 0.01,
                 Duration::from_secs(1),
@@ -483,7 +555,7 @@ mod tests {
     fn test_full_capacity() {
         const FALSE_POSITIVE_RATE: f64 = 0.1;
 
-        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+        let mut bloom_filter = SlidingBloomFilter::<InMemoryStorage>::new(
             100,
             FALSE_POSITIVE_RATE,
             Duration::from_secs(1),
@@ -520,7 +592,7 @@ mod tests {
 
     #[test]
     fn test_clear_functionality() {
-        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+        let mut bloom_filter = SlidingBloomFilter::<InMemoryStorage>::new(
             1000,
             0.01,
             Duration::from_secs(1),
@@ -551,7 +623,7 @@ mod tests {
     fn test_should_create_new_level_edge_case() {
         const MAX_LEVELS: usize = 3;
 
-        let mut bloom_filter = SlidingBloomFilter::<BitVecBitVector>::new(
+        let mut bloom_filter = SlidingBloomFilter::<InMemoryStorage>::new(
             1000,
             0.01,
             Duration::from_millis(500),
@@ -567,6 +639,6 @@ mod tests {
         }
 
         // Levels should have been created appropriately
-        assert!(bloom_filter.levels.len() <= MAX_LEVELS);
+        assert!(bloom_filter.storage.num_levels() <= MAX_LEVELS);
     }
 }
