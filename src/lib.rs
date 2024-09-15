@@ -177,6 +177,7 @@ impl<S: BloomFilterStorage> SlidingBloomFilter<S> {
         let now = SystemTime::now();
         for level in 0..self.max_levels {
             if let Some(timestamp) = self.storage.get_timestamp(level) {
+                #[allow(clippy::collapsible_if)]
                 if now.duration_since(timestamp).unwrap()
                     <= self.level_time * self.max_levels as u32
                 {
